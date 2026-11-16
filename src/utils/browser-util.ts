@@ -1,11 +1,16 @@
 import * as fs from 'fs'
 import * as path from 'path'
-import * as puppeteer from 'puppeteer'
+import { chromium, BrowserContext, Page } from 'playwright'
 
 export interface BrowserLaunchOptions {
   executablePath?: string
   proxyServer?: string
   headless?: boolean
+}
+
+export interface PlaywrightSession {
+  context: BrowserContext
+  page: Page
 }
 
 const getDefaultBrowserPath = (): string | undefined => {
@@ -41,31 +46,85 @@ const getDefaultBrowserPath = (): string | undefined => {
   return candidates.find(p => fs.existsSync(p))
 }
 
+const configureProfile = (profileDir: string) => {
+  const prefsPath = path.join(profileDir, 'Default', 'Preferences')
+  if (!fs.existsSync(prefsPath)) return
+
+  try {
+    const content = fs.readFileSync(prefsPath, 'utf8')
+    const prefs = JSON.parse(content)
+
+    if (!prefs.profile) prefs.profile = {}
+    if (!prefs.profile.content_settings) prefs.profile.content_settings = {}
+    if (!prefs.profile.content_settings.exceptions) {
+      prefs.profile.content_settings.exceptions = {}
+    }
+
+    const exc = prefs.profile.content_settings.exceptions
+    const domains = [
+      'https://www.kmart.com.au:443,*',
+      'https://kmart.com.au:443,*',
+      '[*.]kmart.com.au,*',
+      'https://www.bigw.com.au:443,*',
+      'https://bigw.com.au:443,*',
+      '[*.]bigw.com.au,*',
+      'https://www.target.com.au:443,*',
+      'https://target.com.au:443,*',
+      '[*.]target.com.au,*'
+    ]
+
+    const settingsToDisable = [
+      'braveShields',
+      'shieldsAds',
+      'trackers',
+      'fingerprintingV2',
+      'cosmeticFilteringV2'
+    ]
+
+    for (const settingName of settingsToDisable) {
+      if (!exc[settingName]) exc[settingName] = {}
+      for (const domain of domains) {
+        exc[settingName][domain] = { setting: 2 }
+      }
+    }
+
+    // Prevent "Restore pages? Brave didn't shut down correctly" crash banner
+    prefs.profile.exit_type = 'Normal'
+    prefs.profile.exited_cleanly = true
+
+    fs.writeFileSync(prefsPath, JSON.stringify(prefs))
+  } catch (_) {
+    // Ignore if file is inaccessible
+  }
+}
+
 export const launchBrowser = async (
   userDataDir: string,
   options: BrowserLaunchOptions = {}
-): Promise<puppeteer.Browser> => {
+): Promise<PlaywrightSession> => {
   const resolvedProfileDir = path.resolve(userDataDir)
 
+  // Clean stale lock files from previously interrupted sessions
   if (fs.existsSync(resolvedProfileDir)) {
     const lockFiles = ['SingletonLock', 'SingletonSocket', 'SingletonCookie']
     for (const file of lockFiles) {
       const lockPath = path.join(resolvedProfileDir, file)
-      if (fs.existsSync(lockPath)) {
-        try {
+      try {
+        if (fs.lstatSync(lockPath)) {
           fs.unlinkSync(lockPath)
-        } catch (err) {
-          // Abaikan jika file sedang dikunci proses lain
         }
-      }
+      } catch (_) {}
     }
+
+    configureProfile(resolvedProfileDir)
   }
 
   const args = [
     '--window-size=1920,1080',
     '--no-sandbox',
     '--disable-setuid-sandbox',
-    '--disable-blink-features=AutomationControlled'
+    '--disable-blink-features=AutomationControlled',
+    '--disable-session-crashed-bubble'
   ]
 
   if (
@@ -75,44 +134,36 @@ export const launchBrowser = async (
     args.push('--enable-features=UseOzonePlatform', '--ozone-platform=wayland')
   }
 
-  if (options.proxyServer) {
-    args.push(`--proxy-server=${options.proxyServer}`)
-  }
-
   const executablePath =
     options.executablePath && fs.existsSync(options.executablePath)
       ? options.executablePath
       : getDefaultBrowserPath()
 
-  console.log(`Launching browser: ${executablePath || 'Puppeteer bundled Chromium'}`)
+  console.log(`Launching browser: ${executablePath || 'Playwright bundled Chromium'}`)
 
   const launchOptions: any = {
     headless: options.headless ?? false,
-    userDataDir: resolvedProfileDir,
     ignoreDefaultArgs: ['--enable-automation'],
     args,
-    defaultViewport: null
+    viewport: null
   }
 
   if (executablePath) {
     launchOptions.executablePath = executablePath
   }
 
-  return puppeteer.launch(launchOptions)
-}
-
-export const setupPage = async (
-  page: puppeteer.Page,
-  proxyAuth?: { username?: string; password?: string }
-) => {
-  if (proxyAuth?.username && proxyAuth?.password) {
-    await page.authenticate({
-      username: proxyAuth.username,
-      password: proxyAuth.password
-    })
+  if (options.proxyServer) {
+    launchOptions.proxy = { server: options.proxyServer }
   }
 
-  await page.evaluateOnNewDocument(() => {
+  const context = await chromium.launchPersistentContext(resolvedProfileDir, launchOptions)
+
+  // Mask navigator.webdriver to bypass Akamai Bot Manager / Cloudflare
+  await context.addInitScript(() => {
     delete (Object.getPrototypeOf(navigator) as any).webdriver
   })
+
+  const page = context.pages().length > 0 ? context.pages()[0] : await context.newPage()
+
+  return { context, page }
 }
