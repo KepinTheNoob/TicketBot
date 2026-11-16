@@ -1,5 +1,6 @@
 import * as notifier from 'node-notifier'
 import { launchBrowser } from './browser-util'
+import { launchBrowser } from './browser-util'
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -25,14 +26,22 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
   }
 
   const { page } = await launchBrowser('./playwright_data_kmart')
+  const { page } = await launchBrowser('./playwright_data_kmart')
 
   try {
+    page.setDefaultTimeout(60000)
     page.setDefaultTimeout(60000)
 
     console.log(`Navigating to Kmart product: ${kmartLink}`)
     await page.goto(kmartLink, { waitUntil: 'domcontentloaded' })
     await sleep(4000)
 
+    // Wait and refresh loop until "Add to bag" is available
+    const addToBagLocator = page
+      .locator(
+        'button[data-testid="product-button"], div.product-button-container button, button.product-button, button:has-text("Add to bag"), button:has-text("Add to delivery")'
+      )
+      .first()
     // Wait and refresh loop until "Add to bag" is available
     const addToBagLocator = page
       .locator(
@@ -51,6 +60,12 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
             message: 'Rate limit detected. Cooling down for 3 minutes...',
             sound: false
           })
+          console.log('Akamai rate limit detected (Access Denied). Cooling down for 3 minutes...')
+          notifier.notify({
+            title: 'Kmart',
+            message: 'Rate limit detected. Cooling down for 3 minutes...',
+            sound: false
+          })
           await sleep(180000)
           await page.reload({ waitUntil: 'domcontentloaded' })
           continue
@@ -59,7 +74,21 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
         await addToBagLocator.waitFor({ state: 'visible', timeout: 8000 })
         const btnText = (await addToBagLocator.textContent() || '').trim().toLowerCase()
         const isDisabled = await addToBagLocator.isDisabled()
+        await addToBagLocator.waitFor({ state: 'visible', timeout: 8000 })
+        const btnText = (await addToBagLocator.textContent() || '').trim().toLowerCase()
+        const isDisabled = await addToBagLocator.isDisabled()
 
+        if (
+          !isDisabled &&
+          (btnText.includes('add to bag') ||
+            btnText.includes('add to cart') ||
+            btnText.includes('add to delivery'))
+        ) {
+          console.log(`Item in stock! Button text: "${btnText}". Clicking Add to Bag...`)
+          await addToBagLocator.click()
+          break
+        } else {
+          throw new Error(`Button disabled or out of stock (text: "${btnText}")`)
         if (
           !isDisabled &&
           (btnText.includes('add to bag') ||
@@ -94,7 +123,16 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
       .first()
 
     if (await viewBagBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+    // Navigate to Bag / Checkout
+    const viewBagBtn = page
+      .locator(
+        'button[data-testid="view-bag"], a[data-testid="view-bag"], a[href*="/checkout/bag"], a[href*="/bag"], div[class*="MiniCart"] a, div[class*="Drawer"] a'
+      )
+      .first()
+
+    if (await viewBagBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
       console.log('Clicking View Bag button in popup/drawer...')
+      await viewBagBtn.click()
       await viewBagBtn.click()
       await sleep(3000)
     }
@@ -157,6 +195,7 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
     if (email && (await emailField.isVisible({ timeout: 4000 }).catch(() => false))) {
       console.log('Entering email...')
       await emailField.fill(email)
+      await emailField.fill(email)
     }
 
     const firstNameField = page
@@ -164,6 +203,7 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
       .first()
     if (firstName && (await firstNameField.isVisible({ timeout: 2000 }).catch(() => false))) {
       console.log('Entering first name...')
+      await firstNameField.fill(firstName)
       await firstNameField.fill(firstName)
     }
 
@@ -173,6 +213,7 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
     if (lastName && (await lastNameField.isVisible({ timeout: 2000 }).catch(() => false))) {
       console.log('Entering last name...')
       await lastNameField.fill(lastName)
+      await lastNameField.fill(lastName)
     }
 
     const phoneField = page
@@ -180,6 +221,7 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
       .first()
     if (phoneNumber && (await phoneField.isVisible({ timeout: 2000 }).catch(() => false))) {
       console.log('Entering phone number...')
+      await phoneField.fill(phoneNumber)
       await phoneField.fill(phoneNumber)
     }
 
@@ -192,7 +234,7 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
     if (await continueToDeliveryBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
       console.log('Advancing to Delivery step...')
       await continueToDeliveryBtn.click()
-      await sleep(3000)
+      await sleep(4000)
     }
 
     // Step 3: Fill Delivery (Address, Suburb, State, Postcode)
@@ -235,7 +277,7 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
     if (await continueToPaymentBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
       console.log('Advancing to Payment step...')
       await continueToPaymentBtn.click()
-      await sleep(3000)
+      await sleep(5000)
     }
 
     // Step 4: Payment fields if visible
@@ -252,6 +294,7 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
       .first()
     if (expirationMonth && expirationYear && (await expiryField.isVisible({ timeout: 2000 }).catch(() => false))) {
       console.log('Entering expiry...')
+      await expiryField.fill(`${expirationMonth}/${expirationYear.slice(-2)}`)
       await expiryField.fill(`${expirationMonth}/${expirationYear.slice(-2)}`)
     }
 
@@ -271,12 +314,15 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
     // Uncomment the lines below when ready to auto-submit:
     // const placeOrderButton = page.locator('button[data-testid="place-order"]').first()
     // if (await placeOrderButton.isVisible()) {
+    // const placeOrderButton = page.locator('button[data-testid="place-order"]').first()
+    // if (await placeOrderButton.isVisible()) {
     //   await placeOrderButton.click()
     // }
     // ───────────────────────────────────────────────────────────────────────────
   } catch (error) {
     console.error('Kmart error:', error)
   } finally {
+    // Browser session kept open for user review
     // Browser session kept open for user review
   }
 }
