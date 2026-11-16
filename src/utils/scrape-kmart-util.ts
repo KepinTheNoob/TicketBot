@@ -1,5 +1,5 @@
 import * as notifier from 'node-notifier'
-import { launchBrowser, setupPage } from './browser-util'
+import { launchBrowser } from './browser-util'
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -24,56 +24,54 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
     throw new Error('kmartLink is not set in config.json')
   }
 
-  const browser = await launchBrowser('./puppeteer_data_kmart')
+  const { page } = await launchBrowser('./playwright_data_kmart')
 
   try {
-    const page = await browser.newPage()
-    await setupPage(page)
-    await page.setDefaultNavigationTimeout(60000)
+    page.setDefaultTimeout(60000)
 
     console.log(`Navigating to Kmart product: ${kmartLink}`)
     await page.goto(kmartLink, { waitUntil: 'domcontentloaded' })
     await sleep(4000)
 
-    // Wait and refresh loop until "Add to bag" / "Add to delivery" is available
-    const addToBagSelector =
-      'button[data-testid="product-button"], div.product-button-container button, div[class*="product-button-container"] button, button.product-button, button[data-testid="add-to-bag-button"], button[data-test="add-to-cart-button"], button[aria-label*="Add to bag"], button[aria-label*="Add to delivery"], button[aria-label*="Add to cart"]'
+    // Wait and refresh loop until "Add to bag" is available
+    const addToBagLocator = page
+      .locator(
+        'button[data-testid="product-button"], div.product-button-container button, button.product-button, button:has-text("Add to bag"), button:has-text("Add to delivery")'
+      )
+      .first()
 
     console.log('Checking stock on Kmart...')
     while (true) {
       try {
         const pageTitle = await page.title()
         if (pageTitle.toLowerCase().includes('access denied')) {
-          console.log('Rate limit detected. Cooling down for 3 minutes...')
+          console.log('Akamai rate limit detected (Access Denied). Cooling down for 3 minutes...')
+          notifier.notify({
+            title: 'Kmart',
+            message: 'Rate limit detected. Cooling down for 3 minutes...',
+            sound: false
+          })
           await sleep(180000)
           await page.reload({ waitUntil: 'domcontentloaded' })
           continue
         }
 
-        await page.waitForSelector(addToBagSelector, { timeout: 8000 })
-        const btn = await page.$(addToBagSelector)
-        if (btn) {
-          const btnInfo = await page.evaluate(el => {
-            return {
-              disabled: Boolean((el as HTMLButtonElement).disabled),
-              text: (el.textContent || '').trim().toLowerCase()
-            }
-          }, btn)
+        await addToBagLocator.waitFor({ state: 'visible', timeout: 8000 })
+        const btnText = (await addToBagLocator.textContent() || '').trim().toLowerCase()
+        const isDisabled = await addToBagLocator.isDisabled()
 
-          if (
-            !btnInfo.disabled &&
-            (btnInfo.text.includes('add to bag') ||
-              btnInfo.text.includes('add to cart') ||
-              btnInfo.text.includes('add to delivery'))
-          ) {
-            console.log(`Item in stock! Button text: "${btnInfo.text}". Clicking Add to Bag...`)
-            await btn.click()
-            break
-          } else {
-            throw new Error(`Button disabled or out of stock (text: "${btnInfo.text}")`)
-          }
+        if (
+          !isDisabled &&
+          (btnText.includes('add to bag') ||
+            btnText.includes('add to cart') ||
+            btnText.includes('add to delivery'))
+        ) {
+          console.log(`Item in stock! Button text: "${btnText}". Clicking Add to Bag...`)
+          await addToBagLocator.click()
+          break
+        } else {
+          throw new Error(`Button disabled or out of stock (text: "${btnText}")`)
         }
-        throw new Error('Button not found')
       } catch (err) {
         const randomDelay = Math.floor(Math.random() * 20000) + 20000
         console.log(
@@ -88,13 +86,16 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
 
     await sleep(4000)
 
-    // Navigate to Bag / Cart
-    const viewBagButton = await page.$(
-      'button[data-testid="view-bag"], a[data-testid="view-bag"], a[href*="/checkout/bag"], a[href*="/bag"], a[href*="/cart"], div[class*="MiniCart"] a, div[class*="Drawer"] a, div[class*="drawer"] a'
-    )
-    if (viewBagButton) {
+    // Navigate to Bag / Checkout
+    const viewBagBtn = page
+      .locator(
+        'button[data-testid="view-bag"], a[data-testid="view-bag"], a[href*="/checkout/bag"], a[href*="/bag"], div[class*="MiniCart"] a, div[class*="Drawer"] a'
+      )
+      .first()
+
+    if (await viewBagBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
       console.log('Clicking View Bag button in popup/drawer...')
-      await viewBagButton.click()
+      await viewBagBtn.click()
       await sleep(3000)
     }
 
@@ -109,165 +110,155 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
     await sleep(4000)
 
     // Handle "To suburb or postcode" input field if present on the Bag page
-    const postcodeAutoSuggestSelector =
-      'input[data-testid="postcode-autosuggest-input"], input[aria-label*="suburb or postcode"]'
-    const postcodeAutoSuggest = await page.$(postcodeAutoSuggestSelector)
-    if (postcodeAutoSuggest && (postcode || suburb)) {
-      const currentPostcodeVal = await page.evaluate(
-        el => (el as HTMLInputElement).value || '',
-        postcodeAutoSuggest
-      )
+    const postcodeInput = page
+      .locator('input[data-testid="postcode-autosuggest-input"], input[aria-label*="suburb or postcode"]')
+      .first()
+
+    if ((postcode || suburb) && (await postcodeInput.isVisible({ timeout: 4000 }).catch(() => false))) {
+      const currentVal = await postcodeInput.inputValue()
       const targetLocation = postcode || suburb
-      if (!currentPostcodeVal.includes(targetLocation)) {
+      if (!currentVal.includes(targetLocation)) {
         console.log(`Setting delivery postcode to ${targetLocation}...`)
-        await postcodeAutoSuggest.click({ clickCount: 3 })
-        await page.keyboard.press('Backspace')
-        await postcodeAutoSuggest.type(targetLocation, { delay: 100 })
+        await postcodeInput.click()
+        await postcodeInput.fill(targetLocation)
         await sleep(1500)
 
-        // Select the first autosuggest option or press Enter
-        const suggestion = await page.$(
-          'li[role="option"], div[role="option"], ul[class*="autosuggest"] li, div[class*="suggestion"]'
-        )
-        if (suggestion) {
-          await suggestion.click()
+        const option = page
+          .locator('li[role="option"], div[role="option"], ul[class*="autosuggest"] li, div[class*="suggestion"]')
+          .first()
+        if (await option.isVisible({ timeout: 3000 }).catch(() => false)) {
+          await option.click()
         } else {
           await page.keyboard.press('Enter')
         }
         await sleep(2500)
       } else {
-        console.log(`Postcode already set to "${currentPostcodeVal}".`)
+        console.log(`Postcode already set to "${currentVal}".`)
       }
     }
 
     // Click "Continue to details" button
-    const continueToDetailsSelector =
-      'div[data-testid="bagToCheckout"] button, button[data-testid="checkout-button"], button[data-testid*="continue"], div[class*="BagToCheckoutButton"] button'
+    const continueBtn = page
+      .locator(
+        'div[data-testid="bagToCheckout"] button, button[data-testid="checkout-button"], button:has-text("Continue to details")'
+      )
+      .first()
 
     console.log('Waiting for "Continue to details" button...')
-    await page.waitForSelector(continueToDetailsSelector, { timeout: 15000 })
-    const continueBtn = await page.$(continueToDetailsSelector)
-    if (continueBtn) {
-      console.log('Clicking Continue to details...')
-      await continueBtn.click()
-      await sleep(4000)
-    }
+    await continueBtn.waitFor({ state: 'visible', timeout: 15000 })
+    console.log('Clicking Continue to details...')
+    await continueBtn.click({ timeout: 15000 })
+    await sleep(4000)
 
     // Step 2: Fill Details (Email, Name, Phone)
-    const emailInput = await page.$(
-      'input[name="email"], input[id*="email"], input[data-testid*="email"], input[type="email"]'
-    )
-    if (emailInput && email) {
+    const emailField = page
+      .locator('input[name="email"], input[id*="email"], input[data-testid*="email"], input[type="email"]')
+      .first()
+    if (email && (await emailField.isVisible({ timeout: 4000 }).catch(() => false))) {
       console.log('Entering email...')
-      await emailInput.click({ clickCount: 3 })
-      await emailInput.type(email)
+      await emailField.fill(email)
     }
 
-    const firstNameInput = await page.$(
-      'input[name="firstName"], input[id*="firstName"], input[data-testid*="firstName"]'
-    )
-    if (firstNameInput && firstName) {
+    const firstNameField = page
+      .locator('input[name="firstName"], input[id*="firstName"], input[data-testid*="firstName"]')
+      .first()
+    if (firstName && (await firstNameField.isVisible({ timeout: 2000 }).catch(() => false))) {
       console.log('Entering first name...')
-      await firstNameInput.click({ clickCount: 3 })
-      await firstNameInput.type(firstName)
+      await firstNameField.fill(firstName)
     }
 
-    const lastNameInput = await page.$(
-      'input[name="lastName"], input[id*="lastName"], input[data-testid*="lastName"]'
-    )
-    if (lastNameInput && lastName) {
+    const lastNameField = page
+      .locator('input[name="lastName"], input[id*="lastName"], input[data-testid*="lastName"]')
+      .first()
+    if (lastName && (await lastNameField.isVisible({ timeout: 2000 }).catch(() => false))) {
       console.log('Entering last name...')
-      await lastNameInput.click({ clickCount: 3 })
-      await lastNameInput.type(lastName)
+      await lastNameField.fill(lastName)
     }
 
-    const phoneInput = await page.$(
-      'input[name="phone"], input[name="phoneNumber"], input[id*="phone"], input[data-testid*="phone"], input[type="tel"]'
-    )
-    if (phoneInput && phoneNumber) {
+    const phoneField = page
+      .locator('input[name="phone"], input[name="phoneNumber"], input[id*="phone"], input[type="tel"]')
+      .first()
+    if (phoneNumber && (await phoneField.isVisible({ timeout: 2000 }).catch(() => false))) {
       console.log('Entering phone number...')
-      await phoneInput.click({ clickCount: 3 })
-      await phoneInput.type(phoneNumber)
+      await phoneField.fill(phoneNumber)
     }
 
     // Advance to Step 3: Delivery if a "Continue" button is present
-    const continueToDeliveryBtn = await page.$(
-      'div[data-testid*="details"] button[type="submit"], button[data-testid*="continue"]'
-    )
-    if (continueToDeliveryBtn) {
+    const continueToDeliveryBtn = page
+      .locator(
+        'div[data-testid*="details"] button[type="submit"], button:has-text("Continue to delivery"), button[data-testid*="continue"]'
+      )
+      .first()
+    if (await continueToDeliveryBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+      console.log('Advancing to Delivery step...')
       await continueToDeliveryBtn.click()
       await sleep(3000)
     }
 
     // Step 3: Fill Delivery (Address, Suburb, State, Postcode)
-    const addressInput = await page.$(
-      'input[name="address1"], input[name="streetAddress"], input[id*="address"], input[data-testid*="address"]'
-    )
-    if (addressInput && address) {
+    const addressField = page
+      .locator('input[name="address1"], input[name="streetAddress"], input[id*="address"]')
+      .first()
+    if (address && (await addressField.isVisible({ timeout: 4000 }).catch(() => false))) {
       console.log('Entering address...')
-      await addressInput.click({ clickCount: 3 })
-      await addressInput.type(address)
+      await addressField.fill(address)
     }
 
-    const suburbInput = await page.$(
-      'input[name="suburb"], input[name="city"], input[id*="suburb"], input[data-testid*="suburb"]'
-    )
-    if (suburbInput && suburb) {
+    const suburbField = page
+      .locator('input[name="suburb"], input[name="city"], input[id*="suburb"]')
+      .first()
+    if (suburb && (await suburbField.isVisible({ timeout: 2000 }).catch(() => false))) {
       console.log('Entering suburb...')
-      await suburbInput.click({ clickCount: 3 })
-      await suburbInput.type(suburb)
+      await suburbField.fill(suburb)
     }
 
-    const postcodeInput = await page.$(
-      'input[name="postcode"], input[name="postalCode"], input[id*="postcode"], input[data-testid*="postcode"]'
-    )
-    if (postcodeInput && postcode) {
+    const postcodeField = page
+      .locator('input[name="postcode"], input[name="postalCode"], input[id*="postcode"]')
+      .first()
+    if (postcode && (await postcodeField.isVisible({ timeout: 2000 }).catch(() => false))) {
       console.log('Entering postcode...')
-      await postcodeInput.click({ clickCount: 3 })
-      await postcodeInput.type(postcode)
+      await postcodeField.fill(postcode)
     }
 
-    const stateSelect = await page.$(
-      'select[name="state"], select[id*="state"], select[data-testid*="state"]'
-    )
-    if (stateSelect && state) {
+    const stateSelect = page.locator('select[name="state"], select[id*="state"]').first()
+    if (state && (await stateSelect.isVisible({ timeout: 2000 }).catch(() => false))) {
       console.log(`Selecting state ${state}...`)
-      await page.select('select[name="state"], select[id*="state"]', state)
+      await stateSelect.selectOption(state).catch(() => {})
     }
 
     // Advance to Step 4: Payment if a "Continue" button is present
-    const continueToPaymentBtn = await page.$(
-      'div[data-testid*="delivery"] button[type="submit"], button[data-testid*="payment"]'
-    )
-    if (continueToPaymentBtn) {
+    const continueToPaymentBtn = page
+      .locator(
+        'div[data-testid*="delivery"] button[type="submit"], button:has-text("Continue to payment"), button[data-testid*="payment"]'
+      )
+      .first()
+    if (await continueToPaymentBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+      console.log('Advancing to Payment step...')
       await continueToPaymentBtn.click()
       await sleep(3000)
     }
 
     // Step 4: Payment fields if visible
-    const cardInput = await page.$(
-      'input[name="cardNumber"], input[id*="cardNumber"], input[data-testid*="card"]'
-    )
-    if (cardInput && creditCardNumber) {
+    const cardField = page
+      .locator('input[name="cardNumber"], input[id*="cardNumber"], input[data-testid*="card"]')
+      .first()
+    if (creditCardNumber && (await cardField.isVisible({ timeout: 4000 }).catch(() => false))) {
       console.log('Entering card number...')
-      await cardInput.click({ clickCount: 3 })
-      await cardInput.type(creditCardNumber)
+      await cardField.fill(creditCardNumber)
     }
 
-    const expiryInput = await page.$(
-      'input[name="expiry"], input[name="cardExpiry"], input[id*="expiry"]'
-    )
-    if (expiryInput && expirationMonth && expirationYear) {
+    const expiryField = page
+      .locator('input[name="expiry"], input[name="cardExpiry"], input[id*="expiry"]')
+      .first()
+    if (expirationMonth && expirationYear && (await expiryField.isVisible({ timeout: 2000 }).catch(() => false))) {
       console.log('Entering expiry...')
-      await expiryInput.type(`${expirationMonth}/${expirationYear.slice(-2)}`)
+      await expiryField.fill(`${expirationMonth}/${expirationYear.slice(-2)}`)
     }
 
-    const cvvInput = await page.$(
-      'input[name="cvv"], input[id*="cvv"], input[data-testid*="cvv"]'
-    )
-    if (cvvInput && cvv) {
+    const cvvField = page.locator('input[name="cvv"], input[id*="cvv"], input[data-testid*="cvv"]').first()
+    if (cvv && (await cvvField.isVisible({ timeout: 2000 }).catch(() => false))) {
       console.log('Entering CVV...')
-      await cvvInput.type(cvv)
+      await cvvField.fill(cvv)
     }
 
     notifier.notify({
@@ -278,14 +269,14 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
 
     // ── CHECKOUT DISABLED FOR TESTING ──────────────────────────────────────────
     // Uncomment the lines below when ready to auto-submit:
-    // const placeOrderButton = await page.$('button[data-testid="place-order"]')
-    // if (placeOrderButton) {
+    // const placeOrderButton = page.locator('button[data-testid="place-order"]').first()
+    // if (await placeOrderButton.isVisible()) {
     //   await placeOrderButton.click()
     // }
     // ───────────────────────────────────────────────────────────────────────────
   } catch (error) {
     console.error('Kmart error:', error)
   } finally {
-    // Browser kept open for user review
+    // Browser session kept open for user review
   }
 }

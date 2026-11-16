@@ -1,5 +1,5 @@
 import * as notifier from 'node-notifier'
-import { launchBrowser, setupPage } from './browser-util'
+import { launchBrowser } from './browser-util'
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -24,93 +24,49 @@ export const scrapeBigW = async (config: { [key: string]: string }) => {
     throw new Error('bigwLink is not set in config.json')
   }
 
-  const browser = await launchBrowser('./puppeteer_data_bigw')
+  const { page } = await launchBrowser('./playwright_data_bigw')
 
   try {
-    const page = await browser.newPage()
-    await setupPage(page)
-    await page.setDefaultNavigationTimeout(60000)
+    page.setDefaultTimeout(60000)
 
     console.log(`Navigating to Big W product: ${bigwLink}`)
     await page.goto(bigwLink, { waitUntil: 'domcontentloaded' })
-    await sleep(3000)
+    await sleep(4000)
 
-    // Helper: Cari tombol yang benar-benar bertuliskan "Add to cart" dan aktif (bukan Wishlist)
-    const clickValidAddToCart = async (): Promise<boolean> => {
-      return await page.evaluate(() => {
-        const buttons = Array.from(document.querySelectorAll('button'))
-        const targetBtn = buttons.find(btn => {
-          const text = (btn.innerText || btn.textContent || '')
-            .trim()
-            .toLowerCase()
-          const aria = (btn.getAttribute('aria-label') || '').toLowerCase()
-          const isWishlist =
-            text.includes('wishlist') || aria.includes('wishlist')
-          const isAddCart =
-            text === 'add to cart' ||
-            text === 'add to basket' ||
-            aria.includes('add to cart')
-
-          return (
-            !isWishlist &&
-            isAddCart &&
-            !btn.disabled &&
-            btn.offsetParent !== null
-          )
-        })
-
-        if (targetBtn) {
-          targetBtn.click()
-          return true
-        }
-        return false
-      })
-    }
+    // Wait and refresh loop until "Add to cart" is available
+    const addToCartLocator = page
+      .locator(
+        'button[data-optly-add-to-cart-button="true"], button[data-di-id="pdp--add-to-cart"], div[class*="ProductActionButtons"] button, button[data-test="add-to-cart"], button:has-text("Add to cart")'
+      )
+      .first()
 
     console.log('Checking stock on Big W...')
-    let consecutiveBlocks = 0
-    const MAX_CONSECUTIVE_BLOCKS = 3
-
     while (true) {
       try {
         const pageTitle = await page.title()
         if (pageTitle.toLowerCase().includes('access denied')) {
-          consecutiveBlocks++
-          if (consecutiveBlocks > MAX_CONSECUTIVE_BLOCKS) {
-            throw new Error(
-              'Rate limit persisted after 3 retries. Stopping script to prevent further IP throttling.'
-            )
-          }
-
-          const backoffMinutes = consecutiveBlocks * 5
           console.log(
-            `Rate limit detected (${consecutiveBlocks}/${MAX_CONSECUTIVE_BLOCKS}). Cooling down for ${backoffMinutes} minutes...`
+            'Akamai rate limit detected (Access Denied). Cooling down for 3 minutes...'
           )
           notifier.notify({
             title: 'Big W',
-            message: `Rate limit detected. Cooling down for ${backoffMinutes} minutes...`,
+            message: 'Rate limit detected. Cooling down for 3 minutes...',
             sound: false
           })
-
-          await sleep(backoffMinutes * 60 * 1000)
-          await page.goto(bigwLink, { waitUntil: 'domcontentloaded' })
+          await sleep(180000)
+          await page.reload({ waitUntil: 'domcontentloaded' })
           continue
         }
 
-        consecutiveBlocks = 0
-
-        const clicked = await clickValidAddToCart()
-        if (clicked) {
-          console.log('Item in stock! Clicked valid Add to Cart button.')
+        await addToCartLocator.waitFor({ state: 'visible', timeout: 8000 })
+        const isDisabled = await addToCartLocator.isDisabled()
+        if (!isDisabled) {
+          console.log('Item in stock! Clicking Add to Cart...')
+          await addToCartLocator.click()
           break
         }
-
-        throw new Error('Add to cart button not available or disabled')
+        throw new Error('Button disabled')
       } catch (err) {
-        if (err?.message?.includes('Rate limit persisted')) {
-          throw err
-        }
-
         const randomDelay = Math.floor(Math.random() * 20000) + 20000
         console.log(
           `Out of stock or waiting. Refreshing in ${Math.round(
@@ -122,172 +78,166 @@ export const scrapeBigW = async (config: { [key: string]: string }) => {
       }
     }
 
-    await sleep(2000)
+    await sleep(2500)
 
-    // Cek apakah input postcode benar-benar VISIBLE di layar (bukan hidden element di DOM)
-    const suburbSearchSelector =
-      'input[aria-label*="Suburb search"], input.SuburbInputPrefix__input'
-    const isDrawerVisible = await page.evaluate(sel => {
-      const el = document.querySelector(sel) as HTMLElement | null
-      return Boolean(el && el.offsetParent !== null)
-    }, suburbSearchSelector)
+    // Handle Big W's "Enter your postcode for delivery and availability" side drawer if it appears
+    const suburbInputLocator = page
+      .locator(
+        'input[aria-label*="Suburb search"], input.SuburbInputPrefix__input, input[id*="react-select-"][id$="-input"]'
+      )
+      .first()
 
-    if (isDrawerVisible) {
+    if (await suburbInputLocator.isVisible({ timeout: 4000 }).catch(() => false)) {
       console.log('Delivery postcode side panel detected! Entering location...')
-      const postcodeInputElement = await page.$(suburbSearchSelector)
-      if (postcodeInputElement) {
-        const locationValue = postcode || suburb || '2000'
-        await postcodeInputElement.click()
-        await postcodeInputElement.type(locationValue, { delay: 80 })
-        await sleep(1500)
+      const locationValue = postcode || suburb || '2000'
+      await suburbInputLocator.click()
+      await suburbInputLocator.fill(locationValue)
+      await sleep(1500)
 
-        const dropdownOption = await page.$(
-          'div[class*="-option"], div[id*="react-select-"][id*="-option-0"]'
+      const dropdownOption = page
+        .locator('div[class*="-option"], div[id*="react-select-"][id*="-option-0"]')
+        .first()
+      if (await dropdownOption.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await dropdownOption.click()
+      } else {
+        await page.keyboard.press('Enter')
+      }
+      await sleep(1500)
+
+      const saveDrawerButton = page
+        .locator(
+          'div[class*="ModalDrawerCTAContainer"] button, div[class*="ModalDrawer"] button, button:has-text("Save")'
         )
-        if (dropdownOption) {
-          await dropdownOption.click()
-        } else {
-          await page.keyboard.press('Enter')
-        }
-        await sleep(1000)
+        .first()
+      if (await saveDrawerButton.isVisible({ timeout: 3000 }).catch(() => false)) {
+        console.log('Clicking Save on postcode drawer...')
+        await saveDrawerButton.click()
+        await sleep(3000)
+      }
 
-        const saveDrawerButton = await page.$(
-          'div[class*="ModalDrawerCTAContainer"] button, div[class*="ModalDrawer"] button'
-        )
-        if (saveDrawerButton) {
-          console.log('Clicking Save on postcode drawer...')
-          await saveDrawerButton.click()
-          await sleep(2500)
-        }
-
-        // Re-click Add to Cart jika masih di halaman produk
-        const reClicked = await clickValidAddToCart()
-        if (reClicked) {
-          console.log('Re-clicked Add to cart after saving location.')
-          await sleep(2000)
+      // If still on the product page, re-trigger "Add to cart"
+      if (await addToCartLocator.isVisible({ timeout: 2000 }).catch(() => false)) {
+        if (!(await addToCartLocator.isDisabled())) {
+          console.log('Re-clicking Add to cart after saving location...')
+          await addToCartLocator.click()
+          await sleep(3000)
         }
       }
     }
 
-    // Navigasi eksplisit ke /cart dan verifikasi URL berubah
-    console.log('Navigating to Big W cart page...')
-    await page.goto('https://www.bigw.com.au/cart', {
-      waitUntil: 'networkidle2'
-    })
+    await sleep(3000)
 
-    if (!page.url().includes('/cart')) {
-      throw new Error(`Failed to reach cart page. Current URL: ${page.url()}`)
+    // Navigate to Cart
+    const viewCartButton = page
+      .locator('a[data-test="view-cart"], a[href*="/cart"], button[data-test="view-cart"]')
+      .first()
+    if (await viewCartButton.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await viewCartButton.click()
+    } else {
+      await page.goto('https://www.bigw.com.au/cart', {
+        waitUntil: 'domcontentloaded'
+      })
     }
 
-    // Pastikan cart tidak kosong sebelum menunggu tombol checkout
-    const isCartEmpty = await page.evaluate(() => {
-      const bodyText = document.body.innerText.toLowerCase()
-      return (
-        bodyText.includes('your cart is empty') ||
-        bodyText.includes('cart is currently empty')
+    console.log('On Big W cart page...')
+    await sleep(4000)
+
+    // Select delivery option radio button if not selected yet
+    const deliveryRadio = page
+      .locator(
+        'li[role="radio"]:not(.selected), li[class*="RadioListWrapper"]:not([class*="Selected"]), div[class*="DeliveryOptionLabel"], li[role="radio"]'
       )
-    })
-
-    if (isCartEmpty) {
-      throw new Error(
-        'Navigated to /cart, but cart is empty (Add to Cart failed to register).'
-      )
-    }
-
-    console.log('Confirmed on Big W cart page with item...')
-
-    // Select delivery option radio button if available
-    const deliveryRadioSelector =
-      'li[role="radio"]:not(.selected), li[class*="RadioListWrapper"]:not([class*="Selected"])'
-    const deliveryRadio = await page.$(deliveryRadioSelector)
-    if (deliveryRadio) {
+      .first()
+    if (await deliveryRadio.isVisible({ timeout: 3000 }).catch(() => false)) {
       console.log('Selecting delivery method radio button...')
-      await deliveryRadio.click()
-      await sleep(1500)
-    }
-
-    // Proceed to Checkout
-    const checkoutButtonSelector =
-      'button[data-testid="cart-submit-button"], button[data-di-id="cart--sign-in-to-checkout"], div[class*="CartSummaryActions"] button, button[data-test="checkout-button"]'
-
-    console.log('Waiting for Proceed to checkout button...')
-    await page.waitForSelector(checkoutButtonSelector, {
-      visible: true,
-      timeout: 15000
-    })
-    const checkoutButton = await page.$(checkoutButtonSelector)
-    if (checkoutButton) {
-      console.log('Clicking Proceed to checkout...')
-      await Promise.all([
-        page
-          .waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 })
-          .catch(() => null),
-        checkoutButton.click()
-      ])
-    }
-
-    // Guest checkout handling
-    const guestButtonSelector =
-      'button[data-testid*="guest"], a[data-testid*="guest"], button[data-di-id*="guest"], a[href*="guest"]'
-    const guestButton = await page.$(guestButtonSelector)
-    if (guestButton) {
-      console.log('Clicking Checkout as guest...')
-      await guestButton.click()
+      await deliveryRadio.click().catch(() => {})
       await sleep(3000)
     }
 
-    // Fill delivery details if inputs exist
-    const fillIfPresent = async (selector: string, value?: string) => {
-      if (!value) return
-      const el = await page.$(selector)
-      if (el) await el.type(value, { delay: 30 })
-    }
-
-    await fillIfPresent('input[name="email"], input[id="email"]', email)
-    await fillIfPresent(
-      'input[name="firstName"], input[id="firstName"]',
-      firstName
-    )
-    await fillIfPresent(
-      'input[name="lastName"], input[id="lastName"]',
-      lastName
-    )
-    await fillIfPresent(
-      'input[name="phone"], input[name="phoneNumber"], input[id="phone"]',
-      phoneNumber
-    )
-    await fillIfPresent(
-      'input[name="address1"], input[name="streetAddress"], input[id="address"]',
-      address
-    )
-    await fillIfPresent(
-      'input[name="suburb"], input[name="city"], input[id="suburb"]',
-      suburb
-    )
-    await fillIfPresent(
-      'input[name="postcode"], input[name="postalCode"], input[id="postcode"]',
-      postcode
-    )
-
-    const stateSelect = await page.$('select[name="state"], select[id="state"]')
-    if (stateSelect && state) {
-      await page.select('select[name="state"], select[id="state"]', state)
-    }
-
-    await sleep(2000)
-
-    // Payment fields (Catatan: perlu dicek apakah berada di dalam iframe)
-    await fillIfPresent(
-      'input[name="cardNumber"], input[id="cardNumber"]',
-      creditCardNumber
-    )
-    if (expirationMonth && expirationYear) {
-      await fillIfPresent(
-        'input[name="expiry"], input[name="cardExpiry"], input[id="expiry"]',
-        `${expirationMonth}/${expirationYear.slice(-2)}`
+    // Proceed to Checkout
+    const checkoutButton = page
+      .locator(
+        'button[data-testid="cart-submit-button"], button[data-di-id="cart--sign-in-to-checkout"], div[class*="CartSummaryActions"] button, button:has-text("Proceed to checkout")'
       )
+      .first()
+
+    console.log('Waiting for Proceed to checkout button...')
+    await checkoutButton.waitFor({ state: 'visible', timeout: 15000 })
+    console.log('Clicking Proceed to checkout...')
+    await checkoutButton.click({ timeout: 15000 })
+    await sleep(4000)
+
+    // If Big W prompts with "Checkout as guest", click it
+    const guestButton = page
+      .locator(
+        'button[data-testid*="guest"], a[data-testid*="guest"], button:has-text("Checkout as guest")'
+      )
+      .first()
+    if (await guestButton.isVisible({ timeout: 4000 }).catch(() => false)) {
+      console.log('Clicking Checkout as guest...')
+      await guestButton.click()
     }
-    await fillIfPresent('input[name="cvv"], input[id="cvv"]', cvv)
+
+    await sleep(5000)
+
+    // Fill delivery details if inputs exist (Guest Checkout)
+    const emailInput = page.locator('input[name="email"], input[id="email"]').first()
+    if (email && (await emailInput.isVisible({ timeout: 4000 }).catch(() => false))) {
+      await emailInput.fill(email)
+    }
+
+    const firstNameInput = page.locator('input[name="firstName"], input[id="firstName"]').first()
+    if (firstName && (await firstNameInput.isVisible({ timeout: 2000 }).catch(() => false))) {
+      await firstNameInput.fill(firstName)
+    }
+
+    const lastNameInput = page.locator('input[name="lastName"], input[id="lastName"]').first()
+    if (lastName && (await lastNameInput.isVisible({ timeout: 2000 }).catch(() => false))) {
+      await lastNameInput.fill(lastName)
+    }
+
+    const phoneInput = page.locator('input[name="phone"], input[name="phoneNumber"], input[id="phone"]').first()
+    if (phoneNumber && (await phoneInput.isVisible({ timeout: 2000 }).catch(() => false))) {
+      await phoneInput.fill(phoneNumber)
+    }
+
+    const addressInput = page.locator('input[name="address1"], input[name="streetAddress"], input[id="address"]').first()
+    if (address && (await addressInput.isVisible({ timeout: 2000 }).catch(() => false))) {
+      await addressInput.fill(address)
+    }
+
+    const suburbInput = page.locator('input[name="suburb"], input[name="city"], input[id="suburb"]').first()
+    if (suburb && (await suburbInput.isVisible({ timeout: 2000 }).catch(() => false))) {
+      await suburbInput.fill(suburb)
+    }
+
+    const postcodeInput = page.locator('input[name="postcode"], input[name="postalCode"], input[id="postcode"]').first()
+    if (postcode && (await postcodeInput.isVisible({ timeout: 2000 }).catch(() => false))) {
+      await postcodeInput.fill(postcode)
+    }
+
+    const stateSelect = page.locator('select[name="state"], select[id="state"]').first()
+    if (state && (await stateSelect.isVisible({ timeout: 2000 }).catch(() => false))) {
+      await stateSelect.selectOption(state).catch(() => {})
+    }
+
+    await sleep(4000)
+
+    // Payment fields if visible
+    const cardInput = page.locator('input[name="cardNumber"], input[id="cardNumber"]').first()
+    if (creditCardNumber && (await cardInput.isVisible({ timeout: 4000 }).catch(() => false))) {
+      await cardInput.fill(creditCardNumber)
+    }
+
+    const expiryInput = page.locator('input[name="expiry"], input[name="cardExpiry"], input[id="expiry"]').first()
+    if (expirationMonth && expirationYear && (await expiryInput.isVisible({ timeout: 2000 }).catch(() => false))) {
+      await expiryInput.fill(`${expirationMonth}/${expirationYear.slice(-2)}`)
+    }
+
+    const cvvInput = page.locator('input[name="cvv"], input[id="cvv"]').first()
+    if (cvv && (await cvvInput.isVisible({ timeout: 2000 }).catch(() => false))) {
+      await cvvInput.fill(cvv)
+    }
 
     notifier.notify({
       title: 'Big W',
@@ -295,18 +245,16 @@ export const scrapeBigW = async (config: { [key: string]: string }) => {
       sound: true
     })
 
-    
     // ── CHECKOUT DISABLED FOR TESTING ──────────────────────────────────────────
     // Uncomment the lines below when ready to auto-submit:
-    // const placeOrderButton = await page.$('button[data-test="place-order"]')
-    // if (placeOrderButton) {
+    // const placeOrderButton = page.locator('button[data-test="place-order"]').first()
+    // if (await placeOrderButton.isVisible()) {
     //   await placeOrderButton.click()
     // }
     // ───────────────────────────────────────────────────────────────────────────
-    
   } catch (error) {
     console.error('Big W error:', error)
   } finally {
-    // Browser kept open for user review
+    // Browser session kept open for user review
   }
 }
