@@ -1,5 +1,5 @@
 import * as notifier from 'node-notifier'
-import { launchBrowser, setupPage } from './browser-util'
+import { launchBrowser } from './browser-util'
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -27,12 +27,10 @@ export const scrapeTarget = async (config: { [key: string]: string }) => {
     throw new Error('targetLink setting not set in config.json')
   }
 
-  const browser = await launchBrowser('./puppeteer_data_target')
+  const { page } = await launchBrowser('./playwright_data_target')
 
   try {
-    const page = await browser.newPage()
-    await setupPage(page)
-    await page.setDefaultNavigationTimeout(60000)
+    page.setDefaultTimeout(60000)
 
     const isTargetAU = targetLink.includes('target.com.au')
 
@@ -40,38 +38,31 @@ export const scrapeTarget = async (config: { [key: string]: string }) => {
     if (!isTargetAU && targetEmail && targetPassword) {
       try {
         await page.goto('https://www.target.com')
-        await page.waitForSelector(
-          '#account, button[data-test="@web/AccountLink"], a[id="account"]',
-          { timeout: 8000 }
-        )
-        const accountDropdown = await page.$(
-          '#account, button[data-test="@web/AccountLink"], a[id="account"]'
-        )
-        if (accountDropdown) {
+        const accountDropdown = page
+          .locator('#account, button[data-test="@web/AccountLink"], a[id="account"]')
+          .first()
+        if (await accountDropdown.isVisible({ timeout: 8000 }).catch(() => false)) {
           await accountDropdown.click()
+          await sleep(2000)
+        }
+
+        const signInButton = page
+          .locator('#accountNav-signIn, a[data-test="accountNav-signIn"]')
+          .first()
+        if (await signInButton.isVisible({ timeout: 4000 }).catch(() => false)) {
+          await signInButton.click()
           await sleep(3000)
         }
 
-        const signInButton = await page.$(
-          '#accountNav-signIn, a[data-test="accountNav-signIn"]'
-        )
-        if (signInButton) {
-          await signInButton.click()
-          await sleep(4000)
-        }
-
-        const usernameInput = await page.$('#username')
-        if (usernameInput) {
-          await page.type('#username', targetEmail)
-          await page.type('#password', targetPassword)
+        const usernameInput = page.locator('#username').first()
+        if (await usernameInput.isVisible({ timeout: 4000 }).catch(() => false)) {
+          await usernameInput.fill(targetEmail)
+          await page.locator('#password').first().fill(targetPassword)
           await page.keyboard.press('Enter')
-          await sleep(6000)
+          await sleep(5000)
         }
-      } catch (loginError) {
-        console.log(
-          'Target login step notice:',
-          loginError.message || loginError
-        )
+      } catch (loginError: any) {
+        console.log('Target login notice:', loginError?.message || loginError)
       }
     }
 
@@ -80,26 +71,26 @@ export const scrapeTarget = async (config: { [key: string]: string }) => {
     await sleep(4000)
 
     // Selectors for Add to Cart / Add to Bag across Target AU and Target US
-    const addToCartSelector =
-      'button[data-test="shipItButton"], button[data-test="shippingButton"], button[data-test="add-to-cart-button"], button[id="add-to-cart-button"], button[aria-label*="Add to cart"], button[aria-label*="Add to bag"], button[aria-label*="Add to basket"]'
+    const addToCartLocator = page
+      .locator(
+        'button[data-test="shipItButton"], button[data-test="shippingButton"], button[data-test="add-to-cart-button"], button[id="add-to-cart-button"], button[aria-label*="Add to cart"], button[aria-label*="Add to bag"], button:has-text("Add to bag"), button:has-text("Add to cart")'
+      )
+      .first()
 
     console.log('Checking stock on Target...')
     while (true) {
       try {
-        await page.waitForSelector(addToCartSelector, { timeout: 10000 })
-        const btn = await page.$(addToCartSelector)
-        if (btn) {
-          const isDisabled = await page.evaluate(el => el.disabled, btn)
-          if (!isDisabled) {
-            console.log('Item in stock! Clicking Add to Cart / Bag...')
-            await btn.click()
-            break
-          }
+        await addToCartLocator.waitFor({ state: 'visible', timeout: 8000 })
+        const isDisabled = await addToCartLocator.isDisabled()
+        if (!isDisabled) {
+          console.log('Item in stock! Clicking Add to Cart / Bag...')
+          await addToCartLocator.click()
+          break
         }
         throw new Error('Button disabled or not ready')
       } catch (error) {
-        console.log('Waiting for stock. Refreshing in 10s...')
-        await sleep(10000)
+        console.log('Waiting for stock. Refreshing in 15s...')
+        await sleep(15000)
         await page.reload({ waitUntil: 'domcontentloaded' })
       }
     }
@@ -107,19 +98,21 @@ export const scrapeTarget = async (config: { [key: string]: string }) => {
     await sleep(4000)
 
     // Decline coverage if protection modal pops up (Target US)
-    const noCoverageButton = await page.$(
-      'button[data-test="espModalContent-declineCoverageButton"]'
-    )
-    if (noCoverageButton) {
+    const noCoverageButton = page
+      .locator('button[data-test="espModalContent-declineCoverageButton"]')
+      .first()
+    if (await noCoverageButton.isVisible({ timeout: 3000 }).catch(() => false)) {
       await noCoverageButton.click()
-      await sleep(3000)
+      await sleep(2000)
     }
 
     // View Cart / Checkout
-    const viewCartButton = await page.$(
-      'button[data-test="addToCartModalViewCartCheckout"], a[href*="/cart"], a[data-testid="view-bag"]'
-    )
-    if (viewCartButton) {
+    const viewCartButton = page
+      .locator(
+        'button[data-test="addToCartModalViewCartCheckout"], a[href*="/cart"], a[data-testid="view-bag"]'
+      )
+      .first()
+    if (await viewCartButton.isVisible({ timeout: 4000 }).catch(() => false)) {
       await viewCartButton.click()
     } else {
       const cartUrl = isTargetAU
@@ -130,10 +123,12 @@ export const scrapeTarget = async (config: { [key: string]: string }) => {
 
     await sleep(5000)
 
-    const checkoutButton = await page.$(
-      'button[data-test="checkout-button"], button[data-testid="checkout-button"], a[href*="/checkout"]'
-    )
-    if (checkoutButton) {
+    const checkoutButton = page
+      .locator(
+        'button[data-test="checkout-button"], button[data-testid="checkout-button"], a[href*="/checkout"]'
+      )
+      .first()
+    if (await checkoutButton.isVisible({ timeout: 6000 }).catch(() => false)) {
       await checkoutButton.click()
     }
 
@@ -144,66 +139,66 @@ export const scrapeTarget = async (config: { [key: string]: string }) => {
     const suburbToUse = suburb || city || ''
     const postcodeToUse = postcode || zipCode || ''
 
-    const nameField = await page.$(
-      'input[name="fullName"], input[id="full_name"], input[name="firstName"]'
-    )
-    if (nameField && firstName) {
-      await nameField.type(`${firstName} ${lastName || ''}`)
+    const nameField = page
+      .locator('input[name="fullName"], input[id="full_name"], input[name="firstName"]')
+      .first()
+    if (firstName && (await nameField.isVisible({ timeout: 4000 }).catch(() => false))) {
+      await nameField.fill(`${firstName} ${lastName || ''}`)
     }
 
-    const stateField = await page.$('select[name="state"], select[id="state"]')
-    if (stateField && state) {
-      await page.select('select[name="state"], select[id="state"]', state)
+    const stateField = page.locator('select[name="state"], select[id="state"]').first()
+    if (state && (await stateField.isVisible({ timeout: 2000 }).catch(() => false))) {
+      await stateField.selectOption(state).catch(() => {})
     }
 
-    const addressField = await page.$(
-      'input[name="addressLine1"], input[id="address_line1"], input[name="address1"]'
-    )
-    if (addressField && addressToUse) {
-      await addressField.type(addressToUse)
+    const addressField = page
+      .locator('input[name="addressLine1"], input[id="address_line1"], input[name="address1"]')
+      .first()
+    if (addressToUse && (await addressField.isVisible({ timeout: 2000 }).catch(() => false))) {
+      await addressField.fill(addressToUse)
     }
 
-    const suburbField = await page.$(
-      'input[name="suburb"], input[id="city"], input[name="city"]'
-    )
-    if (suburbField && suburbToUse) {
-      await suburbField.type(suburbToUse)
+    const suburbField = page
+      .locator('input[name="suburb"], input[id="city"], input[name="city"]')
+      .first()
+    if (suburbToUse && (await suburbField.isVisible({ timeout: 2000 }).catch(() => false))) {
+      await suburbField.fill(suburbToUse)
     }
 
-    const postcodeField = await page.$(
-      'input[name="postcode"], input[id="zip_code"], input[name="zipCode"]'
-    )
-    if (postcodeField && postcodeToUse) {
-      await postcodeField.type(postcodeToUse)
+    const postcodeField = page
+      .locator('input[name="postcode"], input[id="zip_code"], input[name="zipCode"]')
+      .first()
+    if (postcodeToUse && (await postcodeField.isVisible({ timeout: 2000 }).catch(() => false))) {
+      await postcodeField.fill(postcodeToUse)
     }
 
-    const phoneField = await page.$(
-      'input[name="phone"], input[id="mobile"], input[name="phoneNumber"]'
-    )
-    if (phoneField && phoneNumber) {
-      await phoneField.type(phoneNumber)
+    const phoneField = page
+      .locator('input[name="phone"], input[id="mobile"], input[name="phoneNumber"]')
+      .first()
+    if (phoneNumber && (await phoneField.isVisible({ timeout: 2000 }).catch(() => false))) {
+      await phoneField.fill(phoneNumber)
     }
 
     // Payment fields
-    const cardField = await page.$(
-      'input[name="creditCard"], input[id="creditCardInput-cardNumber"]'
-    )
-    if (cardField && creditCardNumber) {
-      await cardField.type(creditCardNumber)
+    const cardField = page
+      .locator('input[name="creditCard"], input[id="creditCardInput-cardNumber"]')
+      .first()
+    if (creditCardNumber && (await cardField.isVisible({ timeout: 4000 }).catch(() => false))) {
+      await cardField.fill(creditCardNumber)
     }
 
-    const expiryField = await page.$(
-      'input[name="expiration"], input[id="creditCardInput-expiration"]'
-    )
-    if (expiryField && expirationMonth && expirationYear) {
-      await expiryField.type(`${expirationMonth}/${expirationYear.slice(-2)}`)
+    const expiryField = page
+      .locator('input[name="expiration"], input[id="creditCardInput-expiration"]')
+      .first()
+    if (expirationMonth && expirationYear && (await expiryField.isVisible({ timeout: 2000 }).catch(() => false))) {
+      await expiryField.fill(`${expirationMonth}/${expirationYear.slice(-2)}`)
     }
 
-    const cvvField = await page.$(
-      'input[name="cvv"], input[id="creditCardInput-cvv"]'
-    )
-    if (cvvField && cvv) {
-      await cvvField.type(cvv)
+    const cvvField = page
+      .locator('input[name="cvv"], input[id="creditCardInput-cvv"]')
+      .first()
+    if (cvv && (await cvvField.isVisible({ timeout: 2000 }).catch(() => false))) {
+      await cvvField.fill(cvv)
     }
 
     notifier.notify({
@@ -214,14 +209,12 @@ export const scrapeTarget = async (config: { [key: string]: string }) => {
 
     // ── CHECKOUT DISABLED FOR TESTING ──────────────────────────────────────────
     // Uncomment lines below when ready to auto-submit:
-    // const placeOrderButton = await page.$(
-    //   'button[data-test="placeOrderButton"], button[data-testid="place-order"]'
-    // )
-    // if (placeOrderButton) await placeOrderButton.click()
+    // const placeOrderButton = page.locator('button[data-test="placeOrderButton"], button[data-testid="place-order"]').first()
+    // if (await placeOrderButton.isVisible()) await placeOrderButton.click()
     // ───────────────────────────────────────────────────────────────────────────
   } catch (error) {
     console.error('Target error:', error)
   } finally {
-    // Keep browser open for user review
+    // Keep browser session open for user review
   }
 }
