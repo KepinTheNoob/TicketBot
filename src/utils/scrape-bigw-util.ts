@@ -294,6 +294,16 @@ export const scrapeBigW = async (config: { [key: string]: string }) => {
       message: 'Ready to place order!',
       sound: true
     })
+
+    
+    // ── CHECKOUT DISABLED FOR TESTING ──────────────────────────────────────────
+    // Uncomment the lines below when ready to auto-submit:
+    // const placeOrderButton = await page.$('button[data-test="place-order"]')
+    // if (placeOrderButton) {
+    //   await placeOrderButton.click()
+    // }
+    // ───────────────────────────────────────────────────────────────────────────
+    
   } catch (error) {
     console.error('Big W error:', error)
   } finally {
