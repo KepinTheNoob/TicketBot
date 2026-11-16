@@ -1,0 +1,18 @@
+{
+  "firstName": "John",
+  "lastName": "Doe",
+  "phoneNumber": "0412345678",
+  "email": "email@example.com",
+  "address": "123 George St",
+  "suburb": "Sydney",
+  "state": "NSW",
+  "postcode": "2000",
+  "creditCardNumber": "4111111111111111",
+  "expirationMonth": "10",
+  "expirationYear": "2027",
+  "cvv": "123",
+  "targetLink": "https://www.target.com.au/p/pokemon-tcg-mega-evolution-phantasmal-flames-blisters-assorted/72086971",
+  "kmartLink": "https://www.kmart.com.au/product/pokemon-trading-card-game:-mega-evolution-perfect-order-sleeved-booster-assorted-43737048/",
+  "bigwLink": "https://www.bigw.com.au/product/pokemon-go-plus-/p/283292"
+}
+
