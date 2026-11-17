@@ -36,7 +36,7 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
     // Wait and refresh loop until "Add to bag" is available
     const addToBagLocator = page
       .locator(
-        'button[data-testid="product-button"], div.product-button-container button, button.product-button, button:has-text("Add to bag"), button:has-text("Add to delivery")'
+        'button[data-testid="product-button"], div.product-button-container button, button.product-button'
       )
       .first()
 
@@ -66,8 +66,58 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
             btnText.includes('add to cart') ||
             btnText.includes('add to delivery'))
         ) {
-          console.log(`Item in stock! Button text: "${btnText}". Clicking Add to Bag...`)
-          await addToBagLocator.click()
+          console.log(`Item in stock! Button text: "${btnText}".`)
+
+          // 1. Scroll button to center
+          await addToBagLocator.scrollIntoViewIfNeeded()
+          await sleep(600)
+
+          // 2. Set up listener for Kmart's cart GraphQL response
+          const cartResponsePromise = page
+            .waitForResponse(
+              res => {
+                const url = res.url().toLowerCase()
+                return (
+                  (url.includes('graphql') ||
+                    url.includes('cart') ||
+                    url.includes('bag')) &&
+                  res.status() === 200
+                )
+              },
+              { timeout: 7000 }
+            )
+            .catch(() => null)
+
+          // 3. Dispatch click
+          console.log('Clicking "Add to bag" button...')
+          await page.evaluate(() => {
+            const btn = document.querySelector('button[data-testid="product-button"]') as HTMLElement
+            if (btn) {
+              btn.focus()
+              btn.click()
+            }
+          })
+          await addToBagLocator.click({ force: true }).catch(() => {})
+
+          console.log('Waiting for Add to Bag confirmation from Kmart...')
+          await cartResponsePromise
+
+          // 4. Check if confirmation drawer/popup appears (with "View bag" button)
+          const drawerBtn = page
+            .locator(
+              'button[data-testid="view-bag"], a[data-testid="view-bag"], button[data-testid*="view-bag"], button[data-testid*="checkout"], a[href*="/checkout/bag"], a[href*="/bag"], div[class*="MiniCart"] a, div[class*="Drawer"] a, div[class*="drawer"] a'
+            )
+            .first()
+
+          if (await drawerBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+            console.log('Confirmation drawer detected! Clicking "View bag" in drawer...')
+            await drawerBtn.click().catch(() => {})
+            await sleep(3000)
+          } else {
+            console.log('No mini-bag drawer popup detected, waiting for cart session to persist...')
+            await sleep(3000)
+          }
+
           break
         } else {
           throw new Error(`Button disabled or out of stock (text: "${btnText}")`)
@@ -84,21 +134,7 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
       }
     }
 
-    await sleep(4000)
-
-    // Navigate to Bag / Checkout
-    const viewBagBtn = page
-      .locator(
-        'button[data-testid="view-bag"], a[data-testid="view-bag"], a[href*="/checkout/bag"], a[href*="/bag"], div[class*="MiniCart"] a, div[class*="Drawer"] a'
-      )
-      .first()
-
-    if (await viewBagBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-      console.log('Clicking View Bag button in popup/drawer...')
-      await viewBagBtn.click()
-      await sleep(3000)
-    }
-
+    // Navigate to Bag / Cart if not already navigated via drawer
     if (!page.url().includes('/checkout')) {
       console.log('Navigating directly to Kmart checkout bag...')
       await page.goto('https://www.kmart.com.au/checkout/bag', {
@@ -109,16 +145,28 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
     console.log('On Kmart bag & checkout page...')
     await sleep(4000)
 
-    // Handle "To suburb or postcode" input field if present on the Bag page
+    // Verify bag is not empty
+    const isBagEmpty = await page.evaluate(() => {
+      const text = document.body.innerText.toLowerCase()
+      return text.includes('your bag is empty') || text.includes('bag is empty')
+    })
+    if (isBagEmpty) {
+      console.warn('⚠️ WARNING: Bag appears to be empty on checkout page! Check if item was added properly.')
+    } else {
+      console.log('✅ Bag confirmed with item.')
+    }
+
+    // Handle "To suburb or postcode" input field ONLY if empty
+    // (If already pre-filled like "SYDNEY NSW 2000", changing it breaks Kmart's quote and redirects to home)
     const postcodeInput = page
       .locator('input[data-testid="postcode-autosuggest-input"], input[aria-label*="suburb or postcode"]')
       .first()
 
     if ((postcode || suburb) && (await postcodeInput.isVisible({ timeout: 4000 }).catch(() => false))) {
       const currentVal = await postcodeInput.inputValue()
-      const targetLocation = postcode || suburb
-      if (!currentVal.includes(targetLocation)) {
-        console.log(`Setting delivery postcode to ${targetLocation}...`)
+      if (!currentVal.trim()) {
+        const targetLocation = postcode || suburb
+        console.log(`Entering delivery postcode: ${targetLocation}...`)
         await postcodeInput.click()
         await postcodeInput.fill(targetLocation)
         await sleep(1500)
@@ -133,14 +181,15 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
         }
         await sleep(2500)
       } else {
-        console.log(`Postcode already set to "${currentVal}".`)
+        console.log(`Delivery location already quoted as "${currentVal}". Keeping it to prevent session reset.`)
       }
     }
 
-    // Click "Continue to details" button
+    // Step 1 (Bag): Click "Continue to details" button
+    // Exact selector: div[data-testid="bagToCheckout"] button, button[data-testid="checkout-button"]
     const continueBtn = page
       .locator(
-        'div[data-testid="bagToCheckout"] button, button[data-testid="checkout-button"], button:has-text("Continue to details")'
+        'div[data-testid="bagToCheckout"] button, button[data-testid="checkout-button"]'
       )
       .first()
 
@@ -152,7 +201,7 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
 
     // Step 2: Fill Details (Email, Name, Phone)
     const emailField = page
-      .locator('input[name="email"], input[id*="email"], input[data-testid*="email"], input[type="email"]')
+      .locator('input[data-testid="email"], input[name="email"], input[id="email"]')
       .first()
     if (email && (await emailField.isVisible({ timeout: 4000 }).catch(() => false))) {
       console.log('Entering email...')
@@ -160,7 +209,7 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
     }
 
     const firstNameField = page
-      .locator('input[name="firstName"], input[id*="firstName"], input[data-testid*="firstName"]')
+      .locator('input[data-testid="firstName"], input[name="firstName"], input[id="firstName"]')
       .first()
     if (firstName && (await firstNameField.isVisible({ timeout: 2000 }).catch(() => false))) {
       console.log('Entering first name...')
@@ -168,7 +217,7 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
     }
 
     const lastNameField = page
-      .locator('input[name="lastName"], input[id*="lastName"], input[data-testid*="lastName"]')
+      .locator('input[data-testid="lastName"], input[name="lastName"], input[id="lastName"]')
       .first()
     if (lastName && (await lastNameField.isVisible({ timeout: 2000 }).catch(() => false))) {
       console.log('Entering last name...')
@@ -176,32 +225,49 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
     }
 
     const phoneField = page
-      .locator('input[name="phone"], input[name="phoneNumber"], input[id*="phone"], input[type="tel"]')
+      .locator('input[data-testid="phone"], input[name="phone"], input[id="phone"]')
       .first()
     if (phoneNumber && (await phoneField.isVisible({ timeout: 2000 }).catch(() => false))) {
       console.log('Entering phone number...')
       await phoneField.fill(phoneNumber)
     }
 
-    // Advance to Step 3: Delivery if a "Continue" button is present
+    // Advance to Step 3: Delivery
+    // Exact button: <button type="submit" data-testid="continueToDeliveryButton">
     const continueToDeliveryBtn = page
-      .locator(
-        'div[data-testid*="details"] button[type="submit"], button:has-text("Continue to delivery"), button[data-testid*="continue"]'
-      )
+      .locator('button[data-testid="continueToDeliveryButton"]')
       .first()
     if (await continueToDeliveryBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-      console.log('Advancing to Delivery step...')
+      console.log('Clicking Continue to delivery button...')
       await continueToDeliveryBtn.click()
       await sleep(4000)
     }
 
-    // Step 3: Fill Delivery (Address, Suburb, State, Postcode)
+    // Step 3: Fill Delivery (Address)
+    console.log('On Kmart Delivery step, entering address...')
     const addressField = page
-      .locator('input[name="address1"], input[name="streetAddress"], input[id*="address"]')
+      .locator('input[data-testid="addressInfo"], input[id="addressInfo"], input[name="address1"]')
       .first()
-    if (address && (await addressField.isVisible({ timeout: 4000 }).catch(() => false))) {
-      console.log('Entering address...')
-      await addressField.fill(address)
+    if (addressField && (await addressField.isVisible({ timeout: 4000 }).catch(() => false))) {
+      const addressToType = address || '1 George Street Sydney'
+      console.log(`Entering address: ${addressToType}...`)
+      await addressField.click()
+      await addressField.fill(addressToType)
+
+      // Wait for Kmart's address auto-suggest listbox to appear and click the first option
+      console.log('Waiting for address auto-suggest option...')
+      try {
+        const firstOption = page
+          .locator('#addressInfo-option-0, li.MuiAutocomplete-option, li[role="option"]')
+          .first()
+        await firstOption.waitFor({ state: 'visible', timeout: 8000 })
+        console.log('Selecting first address suggestion from dropdown...')
+        await firstOption.click()
+      } catch (_) {
+        await page.keyboard.press('ArrowDown')
+        await page.keyboard.press('Enter')
+      }
+      await sleep(2000)
     }
 
     const suburbField = page
@@ -226,17 +292,26 @@ export const scrapeKmart = async (config: { [key: string]: string }) => {
       await stateSelect.selectOption(state).catch(() => {})
     }
 
-    // Advance to Step 4: Payment if a "Continue" button is present
-    const continueToPaymentBtn = page
-      .locator(
-        'div[data-testid*="delivery"] button[type="submit"], button:has-text("Continue to payment"), button[data-testid*="payment"]'
+    // Advance to Step 4: Payment
+    // Wait for continueToPaymentButton to become ENABLED (Kmart takes 3-4s for GraphQL validation)
+    const continueToPaymentBtn = page.locator('button[data-testid="continueToPaymentButton"]').first()
+    console.log('Waiting for Continue to payment button to be enabled...')
+    await continueToPaymentBtn.waitFor({ state: 'visible', timeout: 15000 })
+
+    await page
+      .waitForFunction(
+        () => {
+          const btn = document.querySelector('button[data-testid="continueToPaymentButton"]') as HTMLButtonElement
+          return btn && !btn.disabled
+        },
+        null,
+        { timeout: 15000 }
       )
-      .first()
-    if (await continueToPaymentBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-      console.log('Advancing to Payment step...')
-      await continueToPaymentBtn.click()
-      await sleep(5000)
-    }
+      .catch(() => {})
+
+    console.log('Clicking Continue to payment button...')
+    await continueToPaymentBtn.click({ timeout: 10000 })
+    await sleep(5000)
 
     // Step 4: Payment fields if visible
     const cardField = page

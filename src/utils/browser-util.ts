@@ -46,6 +46,58 @@ const getDefaultBrowserPath = (): string | undefined => {
   return candidates.find(p => fs.existsSync(p))
 }
 
+const configureProfile = (profileDir: string) => {
+  const prefsPath = path.join(profileDir, 'Default', 'Preferences')
+  if (!fs.existsSync(prefsPath)) return
+
+  try {
+    const content = fs.readFileSync(prefsPath, 'utf8')
+    const prefs = JSON.parse(content)
+
+    if (!prefs.profile) prefs.profile = {}
+    if (!prefs.profile.content_settings) prefs.profile.content_settings = {}
+    if (!prefs.profile.content_settings.exceptions) {
+      prefs.profile.content_settings.exceptions = {}
+    }
+
+    const exc = prefs.profile.content_settings.exceptions
+    const domains = [
+      'https://www.kmart.com.au:443,*',
+      'https://kmart.com.au:443,*',
+      '[*.]kmart.com.au,*',
+      'https://www.bigw.com.au:443,*',
+      'https://bigw.com.au:443,*',
+      '[*.]bigw.com.au,*',
+      'https://www.target.com.au:443,*',
+      'https://target.com.au:443,*',
+      '[*.]target.com.au,*'
+    ]
+
+    const settingsToDisable = [
+      'braveShields',
+      'shieldsAds',
+      'trackers',
+      'fingerprintingV2',
+      'cosmeticFilteringV2'
+    ]
+
+    for (const settingName of settingsToDisable) {
+      if (!exc[settingName]) exc[settingName] = {}
+      for (const domain of domains) {
+        exc[settingName][domain] = { setting: 2 }
+      }
+    }
+
+    // Prevent "Restore pages? Brave didn't shut down correctly" crash banner
+    prefs.profile.exit_type = 'Normal'
+    prefs.profile.exited_cleanly = true
+
+    fs.writeFileSync(prefsPath, JSON.stringify(prefs))
+  } catch (_) {
+    // Ignore if file is inaccessible
+  }
+}
+
 export const launchBrowser = async (
   userDataDir: string,
   options: BrowserLaunchOptions = {}
@@ -57,19 +109,22 @@ export const launchBrowser = async (
     const lockFiles = ['SingletonLock', 'SingletonSocket', 'SingletonCookie']
     for (const file of lockFiles) {
       const lockPath = path.join(resolvedProfileDir, file)
-      if (fs.existsSync(lockPath)) {
-        try {
+      try {
+        if (fs.lstatSync(lockPath)) {
           fs.unlinkSync(lockPath)
-        } catch (_) {}
-      }
+        }
+      } catch (_) {}
     }
+
+    configureProfile(resolvedProfileDir)
   }
 
   const args = [
     '--window-size=1920,1080',
     '--no-sandbox',
     '--disable-setuid-sandbox',
-    '--disable-blink-features=AutomationControlled'
+    '--disable-blink-features=AutomationControlled',
+    '--disable-session-crashed-bubble'
   ]
 
   if (

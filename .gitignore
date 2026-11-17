@@ -10,5 +10,3 @@ build
 config.json
 puppeteer_data_*
 playwright_data_*
-playwright_data_bigw
-playwright_data_kmart
