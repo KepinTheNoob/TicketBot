@@ -5,6 +5,8 @@ import { chromium, BrowserContext, Page } from 'playwright'
 export interface BrowserLaunchOptions {
   executablePath?: string
   proxyServer?: string
+  proxyUsername?: string
+  proxyPassword?: string
   headless?: boolean
 }
 
@@ -92,6 +94,10 @@ const configureProfile = (profileDir: string) => {
     prefs.profile.exit_type = 'Normal'
     prefs.profile.exited_cleanly = true
 
+    // Prevent restoring old session tabs on startup (avoids opening duplicate about:blank / previous tabs)
+    if (!prefs.session) prefs.session = {}
+    prefs.session.restore_on_startup = 5
+
     fs.writeFileSync(prefsPath, JSON.stringify(prefs))
   } catch (_) {
     // Ignore if file is inaccessible
@@ -112,6 +118,17 @@ export const launchBrowser = async (
       try {
         if (fs.lstatSync(lockPath)) {
           fs.unlinkSync(lockPath)
+        }
+      } catch (_) {}
+    }
+
+    // Clean previous session tabs so Brave starts fresh with 1 tab and never restores old duplicate tabs
+    const sessionsDir = path.join(resolvedProfileDir, 'Default', 'Sessions')
+    if (fs.existsSync(sessionsDir)) {
+      try {
+        const sessionFiles = fs.readdirSync(sessionsDir)
+        for (const file of sessionFiles) {
+          fs.unlinkSync(path.join(sessionsDir, file))
         }
       } catch (_) {}
     }
@@ -153,7 +170,33 @@ export const launchBrowser = async (
   }
 
   if (options.proxyServer) {
-    launchOptions.proxy = { server: options.proxyServer }
+    try {
+      const url = new URL(
+        options.proxyServer.includes('://')
+          ? options.proxyServer
+          : `http://${options.proxyServer}`
+      )
+      if (url.username || url.password) {
+        launchOptions.proxy = {
+          server: `${url.protocol}//${url.host}`,
+          username: decodeURIComponent(url.username),
+          password: decodeURIComponent(url.password)
+        }
+      } else {
+        launchOptions.proxy = {
+          server: options.proxyServer,
+          ...(options.proxyUsername ? { username: options.proxyUsername } : {}),
+          ...(options.proxyPassword ? { password: options.proxyPassword } : {})
+        }
+      }
+    } catch {
+      launchOptions.proxy = {
+        server: options.proxyServer,
+        ...(options.proxyUsername ? { username: options.proxyUsername } : {}),
+        ...(options.proxyPassword ? { password: options.proxyPassword } : {})
+      }
+    }
+    console.log(`Using proxy: ${launchOptions.proxy.server}`)
   }
 
   const context = await chromium.launchPersistentContext(resolvedProfileDir, launchOptions)
@@ -163,7 +206,9 @@ export const launchBrowser = async (
     delete (Object.getPrototypeOf(navigator) as any).webdriver
   })
 
-  const page = context.pages().length > 0 ? context.pages()[0] : await context.newPage()
+  const pages = context.pages()
+  const page = pages.length > 0 ? pages[0] : await context.newPage()
+  await page.bringToFront().catch(() => {})
 
   return { context, page }
 }
