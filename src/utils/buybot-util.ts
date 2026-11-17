@@ -45,7 +45,7 @@ export const inputSchedule = async (prompt: GluegunPrompt) => {
   let cronSchedule = null
   if (isSchedule) {
     const currentDate = new Date()
-    const chosenMonth = currentDate.getMonth().toString()
+    const chosenMonth = (currentDate.getMonth() + 1).toString()
     let chosenDay: string
     let chosenHour: string
     let chosenMinute: string

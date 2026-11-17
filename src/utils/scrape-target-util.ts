@@ -1,26 +1,26 @@
 import * as notifier from 'node-notifier'
 import { launchBrowser } from './browser-util'
+import { Locator } from 'playwright'
 
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+// Helper: Dynamic random delays for human-like pauses
+const randomDelay = (min: number, max: number) => 
+  new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * (max - min + 1) + min)))
+
+// Helper: Spoof keystroke dynamics to avoid behavioral detection
+const humanType = async (locator: Locator, text: string) => {
+  if (!text) return
+  await locator.focus()
+  await locator.clear()
+  // pressSequentially types character by character with a randomized delay
+  await locator.pressSequentially(text, { delay: Math.floor(Math.random() * 80) + 30 })
+  await randomDelay(100, 300)
+}
 
 export const scrapeTarget = async (config: { [key: string]: string }) => {
   const {
-    phoneNumber,
-    firstName,
-    lastName,
-    state,
-    city,
-    suburb,
-    zipCode,
-    postcode,
-    address,
-    creditCardNumber,
-    expirationMonth,
-    expirationYear,
-    cvv,
-    targetEmail,
-    targetPassword,
-    targetLink
+    phoneNumber, firstName, lastName, state, city, suburb, zipCode,
+    postcode, address, creditCardNumber, expirationMonth, expirationYear,
+    cvv, targetEmail, targetPassword, targetLink
   } = config
 
   if (!targetLink) {
@@ -30,359 +30,198 @@ export const scrapeTarget = async (config: { [key: string]: string }) => {
   const { page } = await launchBrowser('./playwright_data_target')
 
   try {
-    page.setDefaultTimeout(60000)
+    page.setDefaultTimeout(30000) // Lowered global timeout to fail faster
 
     const isTargetAU = targetLink.includes('target.com.au')
 
-    // Only attempt Target.com sign in if navigating to Target US and credentials exist
+    // Optional Login Flow (US)
     if (!isTargetAU && targetEmail && targetPassword) {
       try {
-        await page.goto('https://www.target.com')
-        const accountDropdown = page
-          .locator(
-            '#account, button[data-test="@web/AccountLink"], a[id="account"]'
-          )
-          .first()
-        if (
-          await accountDropdown.isVisible({ timeout: 8000 }).catch(() => false)
-        ) {
-          await accountDropdown.click()
-          await sleep(2000)
-        }
+        await page.goto('https://www.target.com', { waitUntil: 'domcontentloaded' })
+        
+        const accountDropdown = page.locator('#account, button[data-test="@web/AccountLink"], a[id="account"]').first()
+        await accountDropdown.waitFor({ state: 'visible', timeout: 5000 })
+        await accountDropdown.click()
 
-        const signInButton = page
-          .locator('#accountNav-signIn, a[data-test="accountNav-signIn"]')
-          .first()
-        if (
-          await signInButton.isVisible({ timeout: 4000 }).catch(() => false)
-        ) {
-          await signInButton.click()
-          await sleep(3000)
-        }
+        const signInButton = page.locator('#accountNav-signIn, a[data-test="accountNav-signIn"]').first()
+        await signInButton.waitFor({ state: 'visible', timeout: 5000 })
+        await signInButton.click()
 
         const usernameInput = page.locator('#username').first()
-        if (
-          await usernameInput.isVisible({ timeout: 4000 }).catch(() => false)
-        ) {
-          await usernameInput.fill(targetEmail)
-          await page
-            .locator('#password')
-            .first()
-            .fill(targetPassword)
-          await page.keyboard.press('Enter')
-          await sleep(5000)
-        }
+        await usernameInput.waitFor({ state: 'visible', timeout: 5000 })
+        
+        // Use human typing instead of instant fill
+        await humanType(usernameInput, targetEmail)
+        await humanType(page.locator('#password').first(), targetPassword)
+        
+        await page.keyboard.press('Enter')
+        await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {})
       } catch (loginError) {
-        console.log('Target login notice:', loginError?.message || loginError)
+        console.log('Target login skipped/failed. Proceeding as guest.', loginError?.message)
       }
     }
 
     console.log(`Navigating to Target product: ${targetLink}`)
     await page.goto(targetLink, { waitUntil: 'domcontentloaded' })
-    await sleep(4000)
 
-    // Selectors for Add to Cart / Add to Bag across Target AU and Target US
-    const addToCartLocator = page
-      .locator(
-        'button[data-test="shipItButton"]:not([disabled]):not([aria-disabled="true"]), button[data-test="shippingButton"]:not([disabled]):not([aria-disabled="true"]), button[data-test="add-to-cart-button"]:not([disabled]):not([aria-disabled="true"]), button[id="add-to-cart-button"]:not([disabled]):not([aria-disabled="true"]), button:has-text("Add to basket"):not([disabled]):not([aria-disabled="true"]), button:has-text("Add to bag"):not([disabled]):not([aria-disabled="true"]), button:has-text("Add to cart"):not([disabled]):not([aria-disabled="true"]), button:has-text("Add to delivery"):not([disabled]):not([aria-disabled="true"])'
-      )
-      .first()
+    const addToCartLocator = page.locator(
+      'button[data-test="shipItButton"]:not([disabled]), button[data-test="shippingButton"]:not([disabled]), button:has-text("Add to basket"):not([disabled]), button:has-text("Add to cart"):not([disabled])'
+    ).first()
 
     console.log('Checking stock on Target...')
-    while (true) {
+    
+    // Bounded Retry Loop: Try up to 50 times instead of while(true)
+    const MAX_ATTEMPTS = 50
+    let addedToCart = false
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
         const pageTitle = await page.title()
-        if (
-          pageTitle.toLowerCase().includes('access denied') ||
-          pageTitle.toLowerCase().includes('just a moment') ||
-          pageTitle.includes('403')
-        ) {
-          throw new Error(`Blocked page detected (Title: "${pageTitle}")`)
+        if (pageTitle.toLowerCase().includes('access denied') || pageTitle.includes('403')) {
+          throw new Error(`WAF Block detected. Proxy burned.`)
         }
 
-        // Tunggu hingga 25 detik agar tombol abu-abu selesai loading & berubah hitam
-        await addToCartLocator.waitFor({ state: 'visible', timeout: 25000 })
-        const btnText = ((await addToCartLocator.textContent()) || '').trim()
+        // Bumped timeout to 20s to account for Target's deliberate JS gray-out delay under load
+        await addToCartLocator.waitFor({ state: 'visible', timeout: 20000 })
+        
+        console.log(`Item in stock (Attempt ${attempt})! Simulating human reaction...`)
+        
+        // 1. Perception Delay: Wait for a human-like reaction time before moving the mouse
+        await randomDelay(600, 1200)
+        
+        // 2. Telemetry Spoofing: Get the button's bounding box to calculate an off-center click
+        const box = await addToCartLocator.boundingBox()
+        if (!box) {
+          throw new Error('Could not find bounding box for Add to Cart button')
+        }
 
-        console.log(
-          `Item in stock ("${btnText}")! Clicking Add to Cart / Bag...`
-        )
-        await addToCartLocator.click()
-        break
+        // Calculate a random click coordinate within the button, avoiding the edges and dead center
+        const randomX = Math.floor(Math.random() * (box.width * 0.6)) + (box.width * 0.2)
+        const randomY = Math.floor(Math.random() * (box.height * 0.6)) + (box.height * 0.2)
+
+        // 3. Humanize the interaction: Hover, delay, and click at the randomized offset
+        await addToCartLocator.hover({ position: { x: randomX, y: randomY } })
+        await randomDelay(200, 500)
+        await addToCartLocator.click({ 
+          position: { x: randomX, y: randomY },
+          delay: Math.floor(Math.random() * 120) + 60 
+        })
+
+        // Wait for the backend GraphQL/REST network request to actually finish
+        await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {})
+        
+        addedToCart = true
+        break // Escape loop on success
       } catch (error) {
-        const rawBtnHtml = await page
-          .locator(
-            'button:has-text("Add To Basket"), button:has-text("Add to bag")'
-          )
-          .first()
-          .evaluate(el => el.outerHTML)
-          .catch(() => 'Button not found in DOM')
-
-        console.log(
-          `Waiting for stock | Reason: ${error?.message?.split('\n')[0] ||
-            'not ready'}`
-        )
-        console.log(`Button state:`, rawBtnHtml)
-        console.log(`Refreshing in 15s...`)
-
-        await sleep(15000)
+        console.log(`Waiting for stock (Attempt ${attempt}/${MAX_ATTEMPTS}). Refreshing...`)
+        await randomDelay(8000, 12000)
         await page.reload({ waitUntil: 'domcontentloaded' })
       }
     }
-    await sleep(4000)
 
-    // Decline coverage if protection modal pops up (Target US)
-    const noCoverageButton = page
-      .locator('button[data-test="espModalContent-declineCoverageButton"]')
-      .first()
-    if (
-      await noCoverageButton.isVisible({ timeout: 3000 }).catch(() => false)
-    ) {
-      await noCoverageButton.click()
-      await sleep(2000)
+    if (!addedToCart) {
+      throw new Error('Failed to add to cart after maximum attempts. Exiting to prevent memory leak.')
     }
 
-    // View Cart / Checkout
-    // 1. Tutup popup "Often Bought Together" secara eksplisit dengan mengklik tombol X atau Escape
-    const closePopupButton = page
-      .locator(
-        'button[aria-label*="close" i], button.lightbox-close, [data-test="modal-close"], button:has-text("✕")'
-      )
-      .first()
-    if (
-      await closePopupButton.isVisible({ timeout: 3000 }).catch(() => false)
-    ) {
+    // Modal cleanup
+    const closePopupButton = page.locator('button[aria-label*="close" i], button.lightbox-close, [data-test="modal-close"], button:has-text("✕")').first()
+    if (await closePopupButton.isVisible({ timeout: 2000 }).catch(() => false)) {
       await closePopupButton.click()
-      await sleep(1000)
-    } else {
-      await page.keyboard.press('Escape')
-      await sleep(1000)
     }
 
-    // 2. Klik tombol View basket yang asli dari modal atau header
-    const viewCartButton = page
-      .locator(
-        'button:has-text("View basket"):visible, a:has-text("View basket"):visible, a[href*="/basket" i]:visible, a[aria-label*="basket" i]:visible, button:has-text("View Cart"):visible'
-      )
-      .first()
-    if (await viewCartButton.isVisible({ timeout: 4000 }).catch(() => false)) {
-      await viewCartButton.click({ force: true })
-      await sleep(3000)
+    const cartUrl = isTargetAU ? 'https://www.target.com.au/spc/basket/' : 'https://www.target.com/cart'
+    await page.goto(cartUrl, { waitUntil: 'domcontentloaded' })
+    
+    // Intercept empty carts immediately to prevent infinite checkout hangs
+    const emptyCartText = page.locator('text="0 ITEMS", text="your basket is empty"').first()
+    if (await emptyCartText.isVisible({ timeout: 5000 }).catch(() => false)) {
+      throw new Error("Target API secretly rejected the Add to Cart request (WAF block). Cart is empty. Aborting.")
     }
 
-    // Jika URL masih tertahan di halaman produk (/p/), buka /spc/basket/ untuk Target AU
-    if (page.url().includes('/p/')) {
-      const cartUrl = isTargetAU
-        ? 'https://www.target.com.au/spc/basket/'
-        : 'https://www.target.com/cart'
-      await page.goto(cartUrl, { waitUntil: 'domcontentloaded' })
-    }
+    // Wait for cart DOM to settle dynamically
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {})
 
-    // Tunggu halaman /spc/basket/ selesai loading (maksimal 25 detik sampai tombol selain footer muncul)
-    console.log('Waiting for Target basket page to finish loading...')
-    await page
-      .waitForFunction(
-        () => {
-          const btns = Array.from(document.querySelectorAll('button'))
-            .map(b => b.innerText.trim())
-            .filter(
-              t => t && t !== 'Conditions of use' && t !== 'Privacy policy'
-            )
-          return btns.length > 0
-        },
-        { timeout: 25000 }
-      )
-      .catch(() =>
-        console.log('Basket page still loading or empty after 25s...')
-      )
-
-    // Select delivery method on Target AU cart if required to enable checkout
-    if (isTargetAU) {
-      const deliveryOption = page
-        .locator(
-          'label:has-text("Delivery"), input[value*="delivery" i], div:has-text("Home Delivery")'
-        )
-        .first()
-      if (
-        await deliveryOption.isVisible({ timeout: 2000 }).catch(() => false)
-      ) {
-        await deliveryOption.click().catch(() => {})
-        await sleep(2000)
-      }
-    }
-
-    const checkoutButton = page
-      .locator(
-        'div[data-testid="bagToCheckout"] button, button[data-test="checkout-button"], button[data-testid="checkout-button"], a[href*="/checkout"], button:has-text("Continue to delivery"), button:has-text("Continue to details"), button:has-text("Checkout"), button:has-text("Proceed to checkout")'
-      )
-      .first()
-
-    if (
-      !(await checkoutButton.isVisible({ timeout: 5000 }).catch(() => false))
-    ) {
-      const btns = await page
-        .locator('button:visible')
-        .allInnerTexts()
-        .catch(() => [])
-      console.log('Basket URL:', page.url(), '| Visible buttons:', btns)
-    }
-
-    await checkoutButton.waitFor({ state: 'visible', timeout: 15000 })
+    const checkoutButton = page.locator(
+      'button[data-test="checkout-button"], a[href*="/checkout"], button:has-text("Checkout")'
+    ).first()
+    
+    await checkoutButton.waitFor({ state: 'visible', timeout: 10000 })
     await checkoutButton.click()
 
-    await sleep(4000)
-
-    // Handle Guest Checkout prompt if shown
-    const guestCheckoutButton = page
-      .locator(
-        'button:has-text("Checkout as guest"), button:has-text("Continue as guest"), a:has-text("guest")'
-      )
-      .first()
-    if (
-      await guestCheckoutButton.isVisible({ timeout: 4000 }).catch(() => false)
-    ) {
+    // Handle Guest Checkout prompt dynamically
+    const guestCheckoutButton = page.locator('button:has-text("Checkout as guest"), a:has-text("guest")').first()
+    if (await guestCheckoutButton.isVisible({ timeout: 3000 }).catch(() => false)) {
       await guestCheckoutButton.click()
-      await sleep(4000)
+      await page.waitForLoadState('domcontentloaded')
     }
 
-    // Fill address details (AU and US compatible)
+    // Checkout Details - using humanType to spoof interaction
     const addressToUse = address || ''
     const suburbToUse = suburb || city || ''
     const postcodeToUse = postcode || zipCode || ''
 
-    const nameField = page
-      .locator(
-        'input[name="fullName"], input[id="full_name"], input[name="firstName"]'
-      )
-      .first()
-    if (
-      firstName &&
-      (await nameField.isVisible({ timeout: 4000 }).catch(() => false))
-    ) {
-      await nameField.fill(`${firstName} ${lastName || ''}`)
+    const nameField = page.locator('input[name="fullName"], input[name="firstName"]').first()
+    if (await nameField.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await humanType(nameField, `${firstName} ${lastName || ''}`)
     }
 
-    const stateField = page
-      .locator('select[name="state"], select[id="state"]')
-      .first()
-    if (
-      state &&
-      (await stateField.isVisible({ timeout: 2000 }).catch(() => false))
-    ) {
+    const addressField = page.locator('input[name="addressLine1"], input[name="address1"]').first()
+    if (await addressField.isVisible({ timeout: 1000 }).catch(() => false)) {
+      await humanType(addressField, addressToUse)
+    }
+
+    const suburbField = page.locator('input[name="suburb"], input[id="city"], input[name="city"]').first()
+    if (await suburbField.isVisible({ timeout: 1000 }).catch(() => false)) {
+      await humanType(suburbField, suburbToUse)
+    }
+
+    const stateField = page.locator('select[name="state"], select[id="state"]').first()
+    if (state && await stateField.isVisible({ timeout: 1000 }).catch(() => false)) {
       await stateField.selectOption(state).catch(() => {})
     }
 
-    const addressField = page
-      .locator(
-        'input[name="addressLine1"], input[id="address_line1"], input[name="address1"]'
-      )
-      .first()
-    if (
-      addressToUse &&
-      (await addressField.isVisible({ timeout: 2000 }).catch(() => false))
-    ) {
-      await addressField.fill(addressToUse)
+    const postcodeField = page.locator('input[name="postcode"], input[name="zipCode"]').first()
+    if (await postcodeField.isVisible({ timeout: 1000 }).catch(() => false)) {
+      await humanType(postcodeField, postcodeToUse)
     }
 
-    const suburbField = page
-      .locator('input[name="suburb"], input[id="city"], input[name="city"]')
-      .first()
-    if (
-      suburbToUse &&
-      (await suburbField.isVisible({ timeout: 2000 }).catch(() => false))
-    ) {
-      await suburbField.fill(suburbToUse)
+    const phoneField = page.locator('input[name="phone"], input[name="phoneNumber"]').first()
+    if (await phoneField.isVisible({ timeout: 1000 }).catch(() => false)) {
+      await humanType(phoneField, phoneNumber)
     }
 
-    const postcodeField = page
-      .locator(
-        'input[name="postcode"], input[id="zip_code"], input[name="zipCode"]'
-      )
-      .first()
-    if (
-      postcodeToUse &&
-      (await postcodeField.isVisible({ timeout: 2000 }).catch(() => false))
-    ) {
-      await postcodeField.fill(postcodeToUse)
-    }
-
-    const phoneField = page
-      .locator(
-        'input[name="phone"], input[id="mobile"], input[name="phoneNumber"]'
-      )
-      .first()
-    if (
-      phoneNumber &&
-      (await phoneField.isVisible({ timeout: 2000 }).catch(() => false))
-    ) {
-      await phoneField.fill(phoneNumber)
-    }
-
-    // Advance from shipping step to payment step if multi-step checkout
-    const continuePaymentButton = page
-      .locator(
-        'button:has-text("Continue"), button:has-text("Save & continue"), button:has-text("Proceed to payment")'
-      )
-      .first()
-    if (
-      await continuePaymentButton
-        .isVisible({ timeout: 3000 })
-        .catch(() => false)
-    ) {
+    // Continue to payment
+    const continuePaymentButton = page.locator('button:has-text("Continue"), button:has-text("Proceed to payment")').first()
+    if (await continuePaymentButton.isVisible({ timeout: 2000 }).catch(() => false)) {
       await continuePaymentButton.click()
-      await sleep(4000)
+      await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {})
     }
 
-    // Payment fields
-    const cardField = page
-      .locator(
-        'input[name="creditCard"], input[id="creditCardInput-cardNumber"]'
-      )
-      .first()
-    if (
-      creditCardNumber &&
-      (await cardField.isVisible({ timeout: 4000 }).catch(() => false))
-    ) {
-      await cardField.fill(creditCardNumber)
+    // Payment Details
+    const cardField = page.locator('input[name="creditCard"], input[id*="cardNumber"]').first()
+    if (await cardField.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await humanType(cardField, creditCardNumber)
     }
 
-    const expiryField = page
-      .locator(
-        'input[name="expiration"], input[id="creditCardInput-expiration"]'
-      )
-      .first()
-    if (
-      expirationMonth &&
-      expirationYear &&
-      (await expiryField.isVisible({ timeout: 2000 }).catch(() => false))
-    ) {
-      await expiryField.fill(`${expirationMonth}/${expirationYear.slice(-2)}`)
+    const expiryField = page.locator('input[name="expiration"], input[id*="expiration"]').first()
+    if (await expiryField.isVisible({ timeout: 1000 }).catch(() => false)) {
+      await humanType(expiryField, `${expirationMonth}/${expirationYear.slice(-2)}`)
     }
 
-    const cvvField = page
-      .locator('input[name="cvv"], input[id="creditCardInput-cvv"]')
-      .first()
-    if (
-      cvv &&
-      (await cvvField.isVisible({ timeout: 2000 }).catch(() => false))
-    ) {
-      await cvvField.fill(cvv)
+    const cvvField = page.locator('input[name="cvv"], input[id*="cvv"]').first()
+    if (await cvvField.isVisible({ timeout: 1000 }).catch(() => false)) {
+      await humanType(cvvField, cvv)
     }
 
     notifier.notify({
       title: isTargetAU ? 'Target Australia' : 'Target',
-      message: 'Ready to place order!',
+      message: 'Ready to place order! Automation paused.',
       sound: true
     })
 
-    // ── CHECKOUT DISABLED FOR TESTING ──────────────────────────────────────────
-    // Uncomment lines below when ready to auto-submit:
-    // const placeOrderButton = page.locator('button[data-test="placeOrderButton"], button[data-testid="place-order"]').first()
-    // if (await placeOrderButton.isVisible()) await placeOrderButton.click()
-    // ───────────────────────────────────────────────────────────────────────────
   } catch (error) {
-    console.error('Target error:', error)
+    console.error('Target scraper encountered a fatal error:', error)
   } finally {
-    // Keep browser session open for user review
+    // Session kept open for manual review
   }
 }

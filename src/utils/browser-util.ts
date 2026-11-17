@@ -1,6 +1,11 @@
 import * as fs from 'fs'
 import * as path from 'path'
-import { chromium, BrowserContext, Page } from 'playwright'
+import { BrowserContext, Page } from 'playwright'
+import { chromium } from 'playwright-extra'
+import stealth = require('puppeteer-extra-plugin-stealth')
+
+// Apply the stealth plugin to the Playwright Chromium instance
+chromium.use(stealth())
 
 export interface BrowserLaunchOptions {
   executablePath?: string
@@ -104,18 +109,19 @@ export const launchBrowser = async (
 ): Promise<PlaywrightSession> => {
   const resolvedProfileDir = path.resolve(userDataDir)
 
-  // Clean stale lock files from previously interrupted sessions
   if (fs.existsSync(resolvedProfileDir)) {
-    const lockFiles = ['SingletonLock', 'SingletonSocket', 'SingletonCookie']
-    for (const file of lockFiles) {
-      const lockPath = path.join(resolvedProfileDir, file)
-      try {
-        if (fs.lstatSync(lockPath)) {
-          fs.unlinkSync(lockPath)
-        }
-      } catch (_) {}
-    }
-
+    // Experiment: Clean stale lock files from previously interrupted sessions
+    // const lockFiles = ['SingletonLock', 'SingletonSocket', 'SingletonCookie']
+    // for (const file of lockFiles) {
+    //   const lockPath = path.join(resolvedProfileDir, file)
+    //   try {
+    //     if (fs.lstatSync(lockPath)) {
+    //       fs.unlinkSync(lockPath)
+    //     }
+    //   } catch (_) {}
+    // }
+    
+    // Safely configure the profile without aggressively deleting system locks
     configureProfile(resolvedProfileDir)
   }
 
@@ -123,7 +129,6 @@ export const launchBrowser = async (
     '--window-size=1920,1080',
     '--no-sandbox',
     '--disable-setuid-sandbox',
-    '--disable-blink-features=AutomationControlled',
     '--disable-session-crashed-bubble'
   ]
 
@@ -156,12 +161,8 @@ export const launchBrowser = async (
     launchOptions.proxy = { server: options.proxyServer }
   }
 
+  // Use the stealth-wrapped chromium instance
   const context = await chromium.launchPersistentContext(resolvedProfileDir, launchOptions)
-
-  // Mask navigator.webdriver to bypass Akamai Bot Manager / Cloudflare
-  await context.addInitScript(() => {
-    delete (Object.getPrototypeOf(navigator) as any).webdriver
-  })
 
   const page = context.pages().length > 0 ? context.pages()[0] : await context.newPage()
 
